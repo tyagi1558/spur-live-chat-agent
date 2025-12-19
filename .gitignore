@@ -40,8 +40,3 @@ coverage/
 *.pem
 .cache/
 
-# Extra files (not needed for submission)
-SUBMISSION_GUIDE.md
-setup.ps1
-setup.sh
-

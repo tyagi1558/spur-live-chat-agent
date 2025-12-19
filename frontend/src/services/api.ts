@@ -1,5 +1,8 @@
 import axios from 'axios';
 
+// Backend URL: Set REACT_APP_API_URL in Vercel environment variables
+// For production: Your Render backend URL (e.g., https://spur-backend.onrender.com)
+// For development: http://localhost:3001
 const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:3001';
 
 export interface ChatMessage {

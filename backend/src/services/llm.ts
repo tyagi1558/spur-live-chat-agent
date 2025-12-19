@@ -62,7 +62,9 @@ export async function generateReply(
       });
 
       if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
+        const errorData = (await response.json().catch(() => ({}))) as {
+          error?: { message?: string };
+        };
         if (response.status === 401) {
           throw new Error("Invalid API key. Please check your OpenAI API key.");
         } else if (response.status === 429) {
@@ -99,7 +101,14 @@ export async function generateReply(
         );
       }
 
-      const data = await response.json();
+      const data = (await response.json()) as {
+        output?: Array<{
+          type?: string;
+          status?: string;
+          content?: Array<{ type?: string; text?: string }>;
+        }>;
+        text?: string;
+      };
 
       // Extract text from response (based on actual API response format)
       // Response structure: data.output[] -> find type: "message" -> content[0].text
