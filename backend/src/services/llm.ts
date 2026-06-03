@@ -17,171 +17,141 @@ Response Guidelines:
 - Always stay professional and focused on customer support.
 - Don't engage in casual conversation unrelated to the store.`;
 
+type ChatRole = "system" | "user" | "assistant";
+type ChatMessage = { role: ChatRole; content: string };
+
+interface ChatCompletionResponse {
+  choices?: Array<{ message?: { content?: string } }>;
+  error?: { message?: string };
+}
+
+const DEFAULT_API_URL = "https://api.openai.com/v1/chat/completions";
+
+function getApiUrl(): string {
+  return process.env.OPENAI_API_URL?.trim() || DEFAULT_API_URL;
+}
+
+function buildMessages(
+  conversationHistory: Array<{ sender: "user" | "ai"; text: string }>,
+  userMessage: string
+): ChatMessage[] {
+  const maxHistory = parseInt(process.env.MAX_CONVERSATION_HISTORY || "10", 10);
+  const messages: ChatMessage[] = [{ role: "system", content: SYSTEM_PROMPT }];
+
+  for (const msg of conversationHistory.slice(-maxHistory)) {
+    messages.push({
+      role: msg.sender === "user" ? "user" : "assistant",
+      content: msg.text,
+    });
+  }
+
+  messages.push({ role: "user", content: userMessage });
+  return messages;
+}
+
 export async function generateReply(
   conversationHistory: Array<{ sender: "user" | "ai"; text: string }>,
   userMessage: string
 ): Promise<string> {
-  const maxRetries = 3;
-  const retryDelay = 2000; // 2 seconds
+  const apiKey = process.env.OPENAI_API_KEY?.trim();
+  if (!apiKey) {
+    throw new Error("OPENAI_API_KEY is not set");
+  }
+
+  const model = process.env.OPENAI_MODEL?.trim() || "gpt-4o-mini";
+  const maxTokens = parseInt(process.env.MAX_TOKENS || "500", 10);
+  const maxRetries = 2;
+  const retryDelayMs = 1500;
+  const messages = buildMessages(conversationHistory, userMessage);
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 45_000);
+
     try {
-      // Build context from conversation history
-      const maxHistory = parseInt(process.env.MAX_CONVERSATION_HISTORY || "10");
-      const recentHistory = conversationHistory.slice(-maxHistory);
-
-      // Create context string from history
-      let contextText = SYSTEM_PROMPT + "\n\n";
-      for (const msg of recentHistory) {
-        contextText += `${msg.sender === "user" ? "Customer" : "Support"}: ${
-          msg.text
-        }\n`;
-      }
-      contextText += `Customer: ${userMessage}`;
-
-      // Prepare input with context
-      const inputText = contextText;
-
-      // Make direct HTTP request to OpenAI API (same as Postman)
-      const apiKey = process.env.OPENAI_API_KEY;
-      if (!apiKey) {
-        throw new Error("OPENAI_API_KEY is not set");
-      }
-
-      const response = await fetch("https://api.openai.com/v1/responses", {
+      const response = await fetch(getApiUrl(), {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${apiKey}`,
         },
         body: JSON.stringify({
-          model: "gpt-5-nano",
-          input: inputText,
-          store: true,
+          model,
+          messages,
+          max_tokens: maxTokens,
         }),
+        signal: controller.signal,
       });
 
+      clearTimeout(timeout);
+      const data = (await response.json().catch(() => ({}))) as ChatCompletionResponse;
+
       if (!response.ok) {
-        const errorData = (await response.json().catch(() => ({}))) as {
-          error?: { message?: string };
-        };
+        const apiMessage = data.error?.message || response.statusText;
+
         if (response.status === 401) {
           throw new Error("Invalid API key. Please check your OpenAI API key.");
-        } else if (response.status === 429) {
-          // Rate limit - retry with exponential backoff
-          if (attempt < maxRetries) {
-            const delay = retryDelay * attempt;
-            console.log(
-              `Rate limit hit, retrying in ${delay}ms... (attempt ${attempt}/${maxRetries})`
-            );
-            await new Promise((resolve) => setTimeout(resolve, delay));
-            continue; // Retry
-          }
+        }
+
+        if (
+          (response.status === 429 || response.status === 503) &&
+          attempt < maxRetries
+        ) {
+          await new Promise((r) => setTimeout(r, retryDelayMs * attempt));
+          continue;
+        }
+
+        if (response.status === 429) {
           throw new Error(
             "Rate limit exceeded. Please wait a moment and try again."
           );
-        } else if (response.status === 503) {
-          // Service unavailable - retry
-          if (attempt < maxRetries) {
-            const delay = retryDelay * attempt;
-            console.log(
-              `Service unavailable, retrying in ${delay}ms... (attempt ${attempt}/${maxRetries})`
-            );
-            await new Promise((resolve) => setTimeout(resolve, delay));
-            continue; // Retry
-          }
+        }
+
+        if (response.status === 503) {
           throw new Error(
             "Service temporarily unavailable. Please try again later."
           );
         }
-        throw new Error(
-          `API error: ${response.status} - ${
-            errorData.error?.message || response.statusText
-          }`
-        );
+
+        throw new Error(`API error: ${response.status} - ${apiMessage}`);
       }
 
-      const data = (await response.json()) as {
-        output?: Array<{
-          type?: string;
-          status?: string;
-          content?: Array<{ type?: string; text?: string }>;
-        }>;
-        text?: string;
-      };
-
-      // Extract text from response (based on actual API response format)
-      // Response structure: data.output[] -> find type: "message" -> content[0].text
-      let reply: string | null = null;
-
-      if (data.output && Array.isArray(data.output)) {
-        // Find the message type output
-        const messageOutput = data.output.find(
-          (item: any) => item.type === "message" && item.status === "completed"
-        );
-
-        if (messageOutput?.content && Array.isArray(messageOutput.content)) {
-          // Find output_text type content
-          const textContent = messageOutput.content.find(
-            (item: any) => item.type === "output_text"
-          );
-          if (textContent?.text) {
-            reply = textContent.text.trim();
-          }
-        }
-      }
-
-      // Fallback: try direct text field (if it's a string)
-      if (!reply && typeof data.text === "string") {
-        reply = data.text.trim();
-      }
-
+      const reply = data.choices?.[0]?.message?.content?.trim();
       if (!reply) {
-        console.error("Response structure:", JSON.stringify(data, null, 2));
-        throw new Error("Empty response from LLM - could not extract text");
+        console.error("Unexpected LLM response:", JSON.stringify(data));
+        throw new Error("Empty response from LLM");
       }
 
       return reply;
-    } catch (error: any) {
-      // Handle network/timeout errors
-      if (
-        error.code === "ECONNABORTED" ||
-        error.message?.includes("timeout") ||
-        error.name === "AbortError"
-      ) {
-        if (attempt < maxRetries) {
-          const delay = retryDelay * attempt;
-          console.log(
-            `Request timeout, retrying in ${delay}ms... (attempt ${attempt}/${maxRetries})`
-          );
-          await new Promise((resolve) => setTimeout(resolve, delay));
-          continue; // Retry
+    } catch (error: unknown) {
+      clearTimeout(timeout);
+
+      if (error instanceof Error) {
+        if (
+          error.message.includes("Invalid API key") ||
+          error.message.includes("Rate limit") ||
+          error.message.includes("Service temporarily") ||
+          error.message.includes("API error:")
+        ) {
+          throw error;
         }
-        throw new Error("Request timeout. Please try again.");
+
+        if (error.name === "AbortError") {
+          if (attempt < maxRetries) {
+            await new Promise((r) => setTimeout(r, retryDelayMs * attempt));
+            continue;
+          }
+          throw new Error("Request timeout. Please try again.");
+        }
       }
 
-      // If it's already a handled error, re-throw it
-      if (
-        error.message?.includes("Rate limit") ||
-        error.message?.includes("Invalid API key") ||
-        error.message?.includes("Service temporarily")
-      ) {
-        throw error;
-      }
-
-      // For other errors, don't retry on last attempt
       if (attempt === maxRetries) {
-        throw new Error(
-          `Failed to generate reply: ${error.message || "Unknown error"}`
-        );
+        const message =
+          error instanceof Error ? error.message : "Unknown error";
+        throw new Error(`Failed to generate reply: ${message}`);
       }
 
-      // Retry for other errors
-      const delay = retryDelay * attempt;
-      console.log(
-        `Error occurred, retrying in ${delay}ms... (attempt ${attempt}/${maxRetries})`
-      );
-      await new Promise((resolve) => setTimeout(resolve, delay));
+      await new Promise((r) => setTimeout(r, retryDelayMs * attempt));
     }
   }
 
