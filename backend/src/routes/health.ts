@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { pool } from '../db/connection';
 import { getRedisClient } from '../services/redis';
+import { resolveLlmConfig } from '../services/llm';
 
 export const healthRouter = Router();
 
@@ -22,10 +23,23 @@ healthRouter.get('/', async (req, res) => {
       }
     }
 
+    let llm: { provider: string; model: string; configured: boolean } = {
+      provider: 'unknown',
+      model: 'unknown',
+      configured: false,
+    };
+    try {
+      const cfg = resolveLlmConfig();
+      llm = { provider: cfg.provider, model: cfg.model, configured: true };
+    } catch {
+      llm.configured = false;
+    }
+
     res.json({
       status: 'ok',
       database: dbStatus,
       redis: redisStatus,
+      llm,
       timestamp: new Date().toISOString(),
     });
   } catch (error) {
@@ -36,5 +50,6 @@ healthRouter.get('/', async (req, res) => {
     });
   }
 });
+
 
 

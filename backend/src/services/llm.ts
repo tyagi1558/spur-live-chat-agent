@@ -25,10 +25,64 @@ interface ChatCompletionResponse {
   error?: { message?: string };
 }
 
-const DEFAULT_API_URL = "https://api.openai.com/v1/chat/completions";
+const OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions";
+const OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions";
 
-function getApiUrl(): string {
-  return process.env.OPENAI_API_URL?.trim() || DEFAULT_API_URL;
+/** Strip accidental quotes when pasting keys into Railway UI. */
+function normalizeApiKey(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+  return raw.trim().replace(/^["']|["']$/g, "");
+}
+
+export interface LlmConfig {
+  apiKey: string;
+  apiUrl: string;
+  model: string;
+  provider: "openai" | "openrouter";
+}
+
+export function resolveLlmConfig(): LlmConfig {
+  const apiKey = normalizeApiKey(process.env.OPENAI_API_KEY);
+  if (!apiKey) {
+    throw new Error("OPENAI_API_KEY is not set");
+  }
+
+  let apiUrl = process.env.OPENAI_API_URL?.trim();
+  let model = process.env.OPENAI_MODEL?.trim() || "gpt-4o-mini";
+
+  const isOpenRouterKey =
+    apiKey.startsWith("sk-or-") || apiKey.startsWith("sk-or-v1-");
+
+  if (!apiUrl && isOpenRouterKey) {
+    apiUrl = OPENROUTER_CHAT_URL;
+    if (!model.includes("/")) {
+      model = "openai/gpt-4o-mini";
+    }
+  }
+
+  if (!apiUrl) {
+    apiUrl = OPENAI_CHAT_URL;
+  }
+
+  const provider = apiUrl.includes("openrouter.ai")
+    ? "openrouter"
+    : "openai";
+
+  if (provider === "openrouter" && !model.includes("/")) {
+    model = `openai/${model}`;
+  }
+
+  return { apiKey, apiUrl, model, provider };
+}
+
+/** Log once at startup (no secrets). */
+export function logLlmConfig(): void {
+  try {
+    const { apiUrl, model, provider } = resolveLlmConfig();
+    console.log(`✓ LLM: ${provider} | model=${model} | url=${apiUrl}`);
+  } catch (e) {
+    console.error("✗ LLM config:", e instanceof Error ? e.message : e);
+  }
 }
 
 function buildMessages(
@@ -53,28 +107,32 @@ export async function generateReply(
   conversationHistory: Array<{ sender: "user" | "ai"; text: string }>,
   userMessage: string
 ): Promise<string> {
-  const apiKey = process.env.OPENAI_API_KEY?.trim();
-  if (!apiKey) {
-    throw new Error("OPENAI_API_KEY is not set");
-  }
-
-  const model = process.env.OPENAI_MODEL?.trim() || "gpt-4o-mini";
+  const { apiKey, apiUrl, model, provider } = resolveLlmConfig();
   const maxTokens = parseInt(process.env.MAX_TOKENS || "500", 10);
   const maxRetries = 2;
   const retryDelayMs = 1500;
   const messages = buildMessages(conversationHistory, userMessage);
+
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${apiKey}`,
+  };
+
+  if (provider === "openrouter") {
+    headers["HTTP-Referer"] =
+      process.env.OPENROUTER_REFERER ||
+      "https://spur-live-chat-agent.netlify.app";
+    headers["X-OpenRouter-Title"] = "Spur Chat Agent";
+  }
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 45_000);
 
     try {
-      const response = await fetch(getApiUrl(), {
+      const response = await fetch(apiUrl, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${apiKey}`,
-        },
+        headers,
         body: JSON.stringify({
           model,
           messages,
@@ -88,9 +146,25 @@ export async function generateReply(
 
       if (!response.ok) {
         const apiMessage = data.error?.message || response.statusText;
+        console.error(
+          `LLM API error ${response.status} (${provider}):`,
+          apiMessage
+        );
 
         if (response.status === 401) {
-          throw new Error("Invalid API key. Please check your OpenAI API key.");
+          if (provider === "openrouter") {
+            throw new Error(
+              "Invalid OpenRouter API key. Use OPENAI_API_KEY with your sk-or-... key, or set OPENAI_API_URL to OpenRouter."
+            );
+          }
+          if (apiKey.startsWith("sk-or-")) {
+            throw new Error(
+              "OpenRouter key detected but calling OpenAI. Set OPENAI_API_URL=https://openrouter.ai/api/v1/chat/completions and OPENAI_MODEL=openai/gpt-4o-mini"
+            );
+          }
+          throw new Error(
+            `Invalid API key for ${provider}. Check OPENAI_API_KEY on Railway (no quotes/spaces). Details: ${apiMessage}`
+          );
         }
 
         if (
@@ -128,7 +202,8 @@ export async function generateReply(
 
       if (error instanceof Error) {
         if (
-          error.message.includes("Invalid API key") ||
+          error.message.includes("Invalid") ||
+          error.message.includes("OpenRouter key") ||
           error.message.includes("Rate limit") ||
           error.message.includes("Service temporarily") ||
           error.message.includes("API error:")
